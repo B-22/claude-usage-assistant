@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+
+# App local state — do NOT publish (window position & UI prefs)
+card_state.json
+
+# Logs
+*.log
+launch_err.log
+
+# Credentials — never commit anything credential-like
+.credentials.json
+*credentials*.json
+*.token
+
+# OS / editor
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/
