@@ -36,22 +36,50 @@ from pathlib import Path
 
 import requests
 
-# ---------------- DPI 自适应 ----------------
+# ---------------- 平台判定 ----------------
+IS_WIN = sys.platform.startswith("win")
+IS_MAC = sys.platform == "darwin"
+IS_LINUX = not IS_WIN and not IS_MAC
+
+# ---------------- DPI 自适应(仅 Windows 需手动处理;mac/Linux 由 Tk 自行缩放)----------------
 SCALE = 1.0
-try:
-    import ctypes
+if IS_WIN:
     try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)
-    except Exception:
-        pass
-    try:
-        SCALE = ctypes.windll.user32.GetDpiForSystem() / 96.0
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass
+        try:
+            SCALE = ctypes.windll.user32.GetDpiForSystem() / 96.0
+        except Exception:
+            SCALE = 1.0
     except Exception:
         SCALE = 1.0
-except Exception:
-    SCALE = 1.0
 
-FONT = "Microsoft YaHei UI"
+# ---------------- 字体(按平台挑第一个系统真正装了的中文字体)----------------
+if IS_WIN:
+    _FONT_CANDIDATES = ["Microsoft YaHei UI", "Microsoft YaHei", "SimHei"]
+elif IS_MAC:
+    _FONT_CANDIDATES = ["PingFang SC", "Hiragino Sans GB", "Heiti SC", "STHeiti", "Arial Unicode MS"]
+else:
+    _FONT_CANDIDATES = ["Noto Sans CJK SC", "Source Han Sans SC", "WenQuanYi Micro Hei",
+                        "WenQuanYi Zen Hei", "Noto Sans CJK", "DejaVu Sans"]
+FONT = _FONT_CANDIDATES[0]
+
+
+def _resolve_font(root) -> None:
+    """创建窗口后,从候选里挑第一个系统真正装了的字体;都没有就保持默认让 Tk 自行回退。"""
+    global FONT
+    try:
+        import tkinter.font as tkfont
+        fams = set(tkfont.families(root))
+        for cand in _FONT_CANDIDATES:
+            if cand in fams:
+                FONT = cand
+                return
+    except Exception:
+        pass
 
 # ---------------- 配置 ----------------
 REFRESH_INTERVAL = 60
@@ -95,11 +123,43 @@ WEEK = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
 # ================= 数据层(与 Claude Code 同源) =================
 def read_token() -> str | None:
+    # 1) 凭证文件:Windows / Linux 始终在此;macOS 若导出过文件也优先用它(官方 SSH 回退机制)
     try:
         creds = json.loads(CREDENTIALS.read_text(encoding="utf-8"))
-        return creds.get("claudeAiOauth", {}).get("accessToken") or None
+        tok = creds.get("claudeAiOauth", {}).get("accessToken")
+        if tok:
+            return tok
     except Exception:
-        return None
+        pass
+    # 2) macOS:从登录钥匙串读取(Claude Code 在 mac 上默认存这里)
+    if IS_MAC:
+        return _read_token_macos_keychain()
+    return None
+
+
+def _read_token_macos_keychain() -> str | None:
+    """mac 上 Claude Code 把凭证存进登录钥匙串的通用密码项,service 名为 'Claude Code-credentials'。"""
+    import subprocess
+    for service in ("Claude Code-credentials", "Claude Code"):  # 个别版本写入名不一致,两个都试
+        try:
+            p = subprocess.run(
+                ["security", "find-generic-password", "-s", service, "-w"],
+                capture_output=True, text=True, timeout=8)
+        except Exception:
+            continue
+        out = (p.stdout or "").strip()
+        if p.returncode != 0 or not out:
+            continue
+        try:
+            data = json.loads(out)
+            tok = data.get("claudeAiOauth", {}).get("accessToken")
+            if tok:
+                return tok
+        except Exception:
+            # 个别版本钥匙串里存的可能直接就是 token 本身
+            if out.startswith("ey") or len(out) > 40:
+                return out
+    return None
 
 
 _ua_cache: str | None = None
@@ -257,16 +317,42 @@ class QuotaCard:
 
         self.root = tk.Tk()
         self.root.title("Claude 用量")
+        _resolve_font(self.root)
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", self.pinned)
+
+        # 透明/圆角:按平台选最稳妥的方案
+        #   Windows -> 洋红色键(-transparentcolor):真透明、圆角
+        #   macOS   -> systemTransparent 背景:真透明、圆角
+        #   Linux   -> 无色键,退化为不透明卡片(方角),仍可整体半透明
+        # 设环境变量 QUOTA_CARD_OPAQUE=1 可在任意系统强制不透明(用于排查显示异常)。
+        canvas_bg = C_CARD
+        force_opaque = bool(os.environ.get("QUOTA_CARD_OPAQUE"))
+        if not force_opaque and IS_WIN:
+            try:
+                self.root.attributes("-transparentcolor", TRANSPARENT)
+                canvas_bg = TRANSPARENT
+            except Exception:
+                canvas_bg = C_CARD
+        elif not force_opaque and IS_MAC:
+            try:
+                self.root.configure(bg="systemTransparent")
+                canvas_bg = "systemTransparent"
+            except Exception:
+                canvas_bg = C_CARD
+        else:
+            try:
+                self.root.configure(bg=C_CARD)
+            except Exception:
+                pass
+            canvas_bg = C_CARD
         try:
-            self.root.attributes("-transparentcolor", TRANSPARENT)
+            self.root.attributes("-alpha", self.alpha)
         except Exception:
             pass
-        self.root.attributes("-alpha", self.alpha)
 
         self._cur_w = self._cur_h = -1
-        self.canvas = tk.Canvas(self.root, bg=TRANSPARENT, highlightthickness=0,
+        self.canvas = tk.Canvas(self.root, bg=canvas_bg, highlightthickness=0,
                                 width=self.s(BW), height=self.s(120))
         self.canvas.pack(fill="both", expand=True)
         self._place_window(cfg)
@@ -842,15 +928,30 @@ _SINGLETON_HANDLE = None
 
 
 def acquire_single_instance() -> bool:
-    """单实例保护:用命名互斥量;成功占用返回 True,已有实例在运行返回 False。"""
+    """单实例保护:Windows 用命名互斥量,mac/Linux 用文件锁;占用成功返回 True。"""
     global _SINGLETON_HANDLE
     try:
-        import ctypes
-        kernel32 = ctypes.windll.kernel32
-        handle = kernel32.CreateMutexW(None, False, "ClaudeQuotaCardSingletonMutex")
-        if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
-            return False
-        _SINGLETON_HANDLE = handle  # 保持引用,进程存活期间一直持有
+        if IS_WIN:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.CreateMutexW(None, False, "ClaudeQuotaCardSingletonMutex")
+            if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+                return False
+            _SINGLETON_HANDLE = handle  # 保持引用,进程存活期间一直持有
+            return True
+        # mac / Linux:对配置目录下的锁文件加排他非阻塞锁
+        import fcntl
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            lock_path = CONFIG_DIR / ".quota_card.lock"
+        except Exception:
+            lock_path = Path.home() / ".quota_card.lock"
+        f = open(lock_path, "w")
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)  # type: ignore[attr-defined]  # fcntl 仅 Unix
+        except OSError:
+            return False  # 已有实例持锁
+        _SINGLETON_HANDLE = f  # 保持文件对象存活,进程退出自动释放锁
         return True
     except Exception:
         return True  # 出错时不阻止启动
