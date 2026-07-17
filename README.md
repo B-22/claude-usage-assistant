@@ -1,6 +1,6 @@
-# AI Usage Assistant (Claude / Codex)
+# AI Usage Assistant (Claude / Codex / Gemini)
 
-A tiny, always-on-top desktop card for **Windows, macOS, and Linux** that shows your **Claude Code** and **OpenAI Codex** usage limits in real time — the 5-hour and 7-day / weekly rolling windows (plus per-model windows such as Claude's 7-day Sonnet / Opus), each with its **reset time in your local timezone**. Show **both sources at once, or just one**. Includes a system-tray indicator.
+A tiny, always-on-top desktop card for **Windows, macOS, and Linux** that shows your **Claude Code**, **OpenAI Codex**, and **Google Gemini** usage limits in real time — the 5-hour and 7-day / weekly rolling windows (plus per-model windows such as Claude's 7-day Sonnet / Opus / Fable), each with its **reset time in your local timezone**. Mix and match **any of the three sources**. Includes a system-tray indicator.
 
 It does **not** bypass any limit — it just makes the official numbers visible so you can pace yourself.
 
@@ -24,13 +24,16 @@ English | [简体中文](README.zh-CN.md)
 
 ## Features
 
-- **Claude and Codex together** — show **both sources at once, or pick just one** (toggle in the menu). With multiple sources the card splits into per-source sections, each with its own plan badge (e.g. Claude `MAX`, Codex `PRO LITE`).
+- **Claude, Codex, and Gemini together** — show **any combination** (toggle in the menu). With multiple sources the card splits into per-source sections, each with its own plan badge (e.g. Claude `MAX`, Codex `PRO LITE`).
 - **No terminal login, tokens don't go stale** — prefers the **Claude desktop app's** continuously-refreshed token; when using the CLI credential it **auto-refreshes via refreshToken and writes it back**. Codex works the same way (reads `~/.codex/auth.json` and auto-refreshes). All local, read-only against your existing login.
 - **Live 5-hour & 7-day (weekly) usage** (and any other windows your account exposes), color-coded green / amber / red.
+- **Stale data turns red immediately** — if a source fails to refresh (rate-limit backoff, network drop, dead token, Gemini tab closed… **or it silently stalls with no error at all**), that source's **title and dot go red**, with how long it's been stale next to it, and the footer names exactly which source is lagging. **The card never passes an old number off as current** — you can always tell at a glance whether to trust the percentage.
 - **Real reset time, your timezone** — shown as a local clock like `今天 04:19` / `06-17 21:59`, derived from your system timezone (UTC+8, UTC+7, …) automatically. A live system clock sits in the footer.
 - **System-tray icon** showing a chosen window's percentage with a `%` sign (default: Claude 5-hour). Left-click toggles the card; hover for a full breakdown.
+- **Follows your system theme** — light/dark switch automatically (Windows reads `AppsUseLightTheme`, macOS `AppleInterfaceStyle`, Linux `gsettings`); or lock it to light or dark from the menu. **Change your system theme while it's running and the card catches up within 10s**, tray icon included — no restart.
+- **Optional title** — turn it off from the menu for a tighter card: just the dot and the plan badge.
 - **Frameless, draggable, always-on-top card.** Resize by mouse-wheel, by dragging the window edges/corners, or via the menu.
-- **Menu** (right-click or the `☰` button): **pick data sources** (Claude / Codex), **show or hide each window individually**, pick **which one the tray reflects**, plus zoom, opacity, and reset-display mode (clock vs. countdown).
+- **Menu** (right-click or the `☰` button): **pick data sources** (Claude / Codex / Gemini), **show or hide each window individually**, pick **which one the tray reflects**, plus zoom, opacity, and reset-display mode (clock vs. countdown).
 - Remembers position, size, opacity, sources, and preferences. **Single-instance guard.** Optional **autostart**.
 - **Cross-platform** — one file runs on Windows, macOS, and Linux; the transparent look adapts per OS.
 - Pure standard-library **tkinter** UI — no heavy UI framework. A single file, fully auditable.
@@ -44,9 +47,16 @@ The card only uses the login state **already on your machine**, picking whicheve
 2. **CLI credential** `~/.claude/.credentials.json` — when near expiry, **auto-refreshed via its refreshToken and written back** (atomic write, `0600` perms).
 3. **macOS Keychain** — `security find-generic-password` (read-only), auto-refreshed the same way.
 
+Desktop-app tokens are **read-only** — the card never refreshes them. An OAuth refreshToken is **single-use**: the moment a third party redeems one, the desktop app's copy is dead and it gets logged out. So that path simply doesn't exist here.
+
 **Codex:** reads `~/.codex/auth.json` (ChatGPT login mode); when near expiry or rejected, **auto-refreshes via its refreshToken and writes it back**.
 
+**Gemini:** the web app's quota lives only in your **browser session** — there's no CLI credential to read, and since Chrome 127+ cookies are sealed with App-Bound Encryption (`v20`), which the system DPAPI key cannot open (getting around it means impersonating the browser's COM elevation service or killing a browser subprocess to race the file — this project does neither). So Gemini works in reverse: a userscript, [`gemini_bridge.user.js`](gemini_bridge.user.js), reads the numbers **in the page, using the page's own session**, and `POST`s the two percentages to the card listening on `127.0.0.1:47615`. **The card never touches a Google credential.**
+
+> To install: right-click the card → **Data sources → Install Gemini script…** The card serves the script with the port already filled in, so your userscript manager just shows its install page — nothing to edit by hand. With a Gemini tab open you get live numbers; close the tab and the card shows the last value and when it arrived. Requires a userscript manager such as [Tampermonkey](https://www.tampermonkey.net/).
+
 - The token goes **only** in the `Authorization` header: Claude only to **`api.anthropic.com`**, Codex only to **`chatgpt.com`** — the same calls their official clients make.
+- The local listener binds **only** to `127.0.0.1` (unreachable from the network), accepts **only** Gemini's two percentages, and cross-origin writes die at the CORS preflight — only `https://gemini.google.com` is allowed through.
 - **No telemetry, no third-party servers.** Nothing is written out, cached, or uploaded anywhere, except refreshing **your own** credential files and a local `card_state.json` holding UI preferences (it contains **no** credentials).
 - Decrypting the desktop token is **entirely local** and reads only what your current Windows/macOS user is already entitled to decrypt (the same protection the OS gives the desktop app); it never touches, rewrites, or uploads it.
 - It only **displays** official usage; it does **not** bypass, modify, or work around any limit.
@@ -54,7 +64,13 @@ The card only uses the login state **already on your machine**, picking whicheve
 
 ## Disclaimer
 
-This tool reads usage from `https://api.anthropic.com/api/oauth/usage` (Claude) and `https://chatgpt.com/backend-api/wham/usage` (Codex) — both **undocumented internal endpoints** used by their respective clients. Neither is a public/official API, and **either may change or stop working at any time**. Endpoint URLs and field names are kept as constants near the top of `quota_card.py` so a fix is a one-line change. This project is **not affiliated with or endorsed by Anthropic or OpenAI**.
+This tool reads usage from `https://api.anthropic.com/api/oauth/usage` (Claude), `https://chatgpt.com/backend-api/wham/usage` (Codex), and `gemini.google.com`'s `batchexecute` (Gemini, called in-page by the userscript) — all **undocumented internal endpoints** used by their respective clients. None is a public/official API, and **any of them may change or stop working at any time**. Endpoint URLs and field names are kept as constants near the top of `quota_card.py` so a fix is a one-line change. This project is **not affiliated with or endorsed by Anthropic, OpenAI, or Google**.
+
+> **About Claude's 429s.** `/api/oauth/usage` is rate-limited **per account**, and **every Claude Code session** plus the desktop app itself background-polls the same bucket ([claude-code#30930](https://github.com/anthropics/claude-code/issues/30930)). Poll it hard and everyone eats 429s together.
+>
+> This card's approach is **fast when healthy, back off on impact**: a real request every 60s (`CLAUDE_MIN_INTERVAL`); on an actual 429 it backs off per `retry-after` (that header sometimes says `0`, which is not to be trusted — then it falls back to a 120→900s exponential backoff), sends **nothing at all** while backing off, and keeps showing the last numbers. That beats blanket slow polling: data is fresh when things are fine, and it yields only when they aren't — and **the moment data goes stale the card turns red** (below), so an old number never masquerades as a current one.
+>
+> If you run many Claude Code sessions and hit 429s often, just raise `CLAUDE_MIN_INTERVAL`. Also worth knowing: **the reset countdown is computed locally from `resets_at`, so it stays exact even when the percentage is stale.**
 
 ## Platform support
 
@@ -136,7 +152,7 @@ Report back in my language when done.
 - **Drag** the card to move it (position is remembered).
 - **Mouse-wheel** to zoom · **drag window edges/corners** to resize · **Ctrl + wheel** to fine-tune opacity.
 - **Top bar:** `▲` keep-on-top · `☰` menu · `↻` refresh · `✕` quit.
-- **Menu** (right-click or `☰`): Refresh · **Data sources** (tick Claude / Codex — multi-select) · **Card items** (show or hide each window) · **Tray item** (which window's % the tray shows) · Zoom · Opacity · Reset display · Keep on top · Hide to tray · Quit.
+- **Menu** (right-click or `☰`): Refresh · **Data sources** (tick Claude / Codex / Gemini — multi-select; **Install Gemini script…** at the bottom) · **Card items** (show or hide each window) · **Tray item** (which window's % the tray shows) · Zoom · Opacity · Reset display · **Theme** (follow system / light / dark) · **Show title** · Keep on top · Click-through · Hide to tray · Quit.
 - **Tray icon:** shows the selected window's `%`; left-click toggles the card; right-click for the menu.
 
 Bar colors: green `< 50%`, amber `50–80%`, red `≥ 80%`.
@@ -145,11 +161,17 @@ Bar colors: green `< 50%`, amber `50–80%`, red `≥ 80%`.
 
 Constants near the top of `quota_card.py`:
 
-- `REFRESH_INTERVAL` — auto-refresh seconds (default `60`).
+- `REFRESH_INTERVAL` — UI polling tick, in seconds (default `60`).
+- `CLAUDE_MIN_INTERVAL` — minimum seconds between **real** Claude requests (default `60`). Raise it if you hit 429s often (see "About Claude's 429s" above).
+- `CLAUDE_BACKOFF_MIN` / `CLAUDE_BACKOFF_MAX` — exponential backoff range used on a 429 when `retry-after` isn't trustworthy (default `120` → `900` seconds).
+- `STALE_AFTER` — go red after this many seconds without a successful refresh (default `180`, i.e. 3 refresh cycles).
+- `GEMINI_PORT` — local port for the Gemini bridge (default `47615`, bound to `127.0.0.1` only). If you change it, reinstall the script (menu → **Install Gemini script…**) — the port is baked in when the card serves it.
 - `API_URL_USAGE` (Claude), `CODEX_USAGE_URL` (Codex), and the field names — edit here if an endpoint ever changes.
 - `CLAUDE_TOKEN_URLS` / `CODEX_TOKEN_URL` — the OAuth endpoints used for auto-refresh.
 
-Preferences (position, zoom, opacity, sources, shown items, tray item, reset mode) are saved to `card_state.json`.
+- `PALETTES` — the light and dark color palettes; edit here to restyle (change both).
+
+Preferences (position, zoom, opacity, sources, shown items, tray item, reset mode, theme, title visibility) are saved to `card_state.json`.
 
 **Environment variables:**
 
