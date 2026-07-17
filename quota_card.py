@@ -4,16 +4,22 @@ Claude / Codex 实时限额卡片  (quota_card.py)
 ============================================
 常驻桌面、置顶、卡片式小部件,实时显示 AI 编码助手的额度使用情况,
 并按"系统本地时区"显示每个窗口的实际重置时刻。附带系统托盘图标。
-支持两个数据源,可在菜单"数据源"里同时显示或只选其一:
+支持三个数据源,可在菜单"数据源"里任意组合:
 
   · Claude —— GET https://api.anthropic.com/api/oauth/usage(与 Claude Code 同源)
       额度在服务端按账号统计:CLI / 桌面版 / 网页的用量都计入同一份额度。
-      凭证:~/.claude/.credentials.json(macOS 亦支持登录钥匙串)。
-      accessToken 过期时自动用 refreshToken 续期并写回,不再依赖终端登录刷新。
+      凭证:~/.claude/.credentials.json(macOS 亦支持登录钥匙串),或直接复用 Claude
+      桌面版持续续期的令牌(只读)。accessToken 过期时用 refreshToken 续期并写回。
+      注意该接口按**账号**限流,且 Claude Code 每个会话自己也在轮询同一个桶,
+      所以这里最多 5 分钟才真拉一次(见 CLAUDE_MIN_INTERVAL)。
   · Codex —— GET https://chatgpt.com/backend-api/wham/usage(与 Codex CLI 同源)
       凭证:~/.codex/auth.json(ChatGPT 登录模式);同样自动续期并写回。
+  · Gemini —— 由油猴脚本 gemini_bridge.user.js 从页面里取数后推送到 127.0.0.1。
+      网页版配额只存在于浏览器会话里,且 cookie 被 Chrome 的 App-Bound Encryption 锁死,
+      所以是"页面推给卡片",而不是卡片去读凭证。装法:右键 → 数据源 → 安装 Gemini 脚本。
 
-凭证只放进 HTTP Authorization 头、只发往各自官方域名,绝不上传到任何其它地方。
+凭证只放进 HTTP Authorization 头、只发往各自官方域名,绝不上传到任何其它地方;
+Gemini 一路更是完全不接触 Google 凭证。
 
 界面:Python 自带 tkinter;托盘:pystray + Pillow(缺失时自动降级为仅卡片)。
 
@@ -35,6 +41,7 @@ import threading
 import time
 import tkinter as tk
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import requests
@@ -88,6 +95,21 @@ def _resolve_font(root) -> None:
 REFRESH_INTERVAL = 60
 REFRESH_RETRY_COOLDOWN = 60  # token 续期失败后的最小重试间隔(秒)
 
+# /api/oauth/usage 是**按账号**限流的元数据接口,而且 Claude Code 每个会话、桌面版自己
+# 都在后台轮询它——大家共用同一个桶(anthropics/claude-code#30930)。
+# 策略是"平时快、撞墙就退":正常 60 秒刷一次拿新鲜数字;一旦真吃到 429,就按 retry-after
+# 退避(该头有时返回 0,不可信,此时改用指数退避),退避期间一个请求都不发。
+# 这比"一律慢轮询"好——健康时数据是新的,出问题时才让路,而且卡片会把"数据不新鲜"
+# 明确标红(见 STALE_AFTER / QuotaCard._stale),不会拿旧数字冒充新的。
+# 若你同时开着很多 Claude Code 会话、频繁吃 429,把 CLAUDE_MIN_INTERVAL 调大即可。
+CLAUDE_MIN_INTERVAL = 60            # 两次真实请求之间的最小间隔(秒)
+CLAUDE_BACKOFF_MIN = 120.0          # 吃到 429 且无可信 retry-after 时的起始退避
+CLAUDE_BACKOFF_MAX = 900.0          # 退避上限
+
+# 距上次成功刷新超过这么久 → 视为"不新鲜",标题标红。取 3 个刷新周期:偶尔漏一拍不报警,
+# 真的连不上/在退避才报。
+STALE_AFTER = 180
+
 # Claude(与 Claude Code CLI 同源的官方接口与 OAuth 客户端)
 API_URL_USAGE = "https://api.anthropic.com/api/oauth/usage"
 API_URL_PROFILE = "https://api.anthropic.com/api/oauth/profile"
@@ -116,20 +138,75 @@ BW, BPAD, BROW, BHEADER, BFOOTER, BRAD = 300, 15, 52, 34, 32, 15
 BSEC, BMSG = 26, 36  # 分节标题高度 / 单行提示高度(基准像素)
 TRANSPARENT = "#ff00ff"
 
-C_CARD = "#1b1c20"
-C_BORDER = "#2e3038"
-C_TITLE = "#ECECEC"
-C_SUB = "#9aa0aa"
-C_DIM = "#6b7280"
-C_TRACK = "#2a2c33"
-C_ACCENT = "#c96442"
-C_GREEN = "#46c46a"
-C_AMBER = "#e0a23a"
-C_RED = "#ef5350"
+# ---------------- 主题 ----------------
+# 两套调色板。C_* 保持模块级常量(卡片里 40 多处直接引用),换肤时由 apply_theme() 整体
+# 改写——这样绘制代码一行都不用动。
+PALETTES = {
+    "light": {"card": "#ffffff", "border": "#e0e0e0", "title": "#1a1a1a", "sub": "#666666",
+              "dim": "#999999", "track": "#ebebeb", "accent": "#c96442",
+              "green": "#2ea84a", "amber": "#d4940a", "red": "#e53935",
+              "tray_bg": (255, 255, 255, 230)},
+    "dark":  {"card": "#1b1c20", "border": "#2e3038", "title": "#ECECEC", "sub": "#9aa0aa",
+              "dim": "#6b7280", "track": "#2a2c33", "accent": "#c96442",
+              "green": "#46c46a", "amber": "#e0a23a", "red": "#ef5350",
+              "tray_bg": (27, 28, 32, 255)},
+}
+C_CARD = C_BORDER = C_TITLE = C_SUB = C_DIM = C_TRACK = C_ACCENT = C_GREEN = C_AMBER = C_RED = ""
+C_TRAY_BG = (255, 255, 255, 230)
+THEME_MODES = (("auto", "跟随系统"), ("light", "浅色"), ("dark", "深色"))
 
-PROVIDERS = ("claude", "codex")
-PROVIDER_TITLES = {"claude": "Claude", "codex": "Codex"}
-PROVIDER_DOTS = {"claude": C_ACCENT, "codex": "#10a37f"}
+
+def system_theme() -> str:
+    """读系统的浅/深色偏好,读不到就当浅色。"""
+    if IS_WIN:
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as k:
+                # 要读 AppsUseLightTheme(应用主题);SystemUsesLightTheme 管的是任务栏/开始菜单,
+                # 两者可以不一致,卡片是应用,所以跟前者。
+                return "light" if winreg.QueryValueEx(k, "AppsUseLightTheme")[0] else "dark"
+        except Exception:
+            return "light"
+    if IS_MAC:
+        try:
+            import subprocess
+            p = subprocess.run(["defaults", "read", "-g", "AppleInterfaceStyle"],
+                               capture_output=True, text=True, timeout=5)
+            # 浅色时这个键根本不存在(命令返回非 0),所以只认明确的 "Dark"
+            return "dark" if "dark" in (p.stdout or "").strip().lower() else "light"
+        except Exception:
+            return "light"
+    try:  # Linux/GNOME:先看 color-scheme,老版本没有就退回看 gtk-theme 名里带不带 dark
+        import subprocess
+        for args, hit in ((["gsettings", "get", "org.gnome.desktop.interface", "color-scheme"], "prefer-dark"),
+                          (["gsettings", "get", "org.gnome.desktop.interface", "gtk-theme"], "dark")):
+            p = subprocess.run(args, capture_output=True, text=True, timeout=5)
+            if p.returncode == 0 and hit in (p.stdout or "").lower():
+                return "dark"
+    except Exception:
+        pass
+    return "light"
+
+
+def apply_theme(mode: str) -> str:
+    """mode ∈ {'auto','light','dark'};返回实际生效的 'light' / 'dark'。"""
+    global C_CARD, C_BORDER, C_TITLE, C_SUB, C_DIM, C_TRACK
+    global C_ACCENT, C_GREEN, C_AMBER, C_RED, C_TRAY_BG
+    eff = system_theme() if mode == "auto" else (mode if mode in PALETTES else "light")
+    p = PALETTES[eff]
+    C_CARD, C_BORDER, C_TITLE, C_SUB, C_DIM, C_TRACK = (
+        p["card"], p["border"], p["title"], p["sub"], p["dim"], p["track"])
+    C_ACCENT, C_GREEN, C_AMBER, C_RED = p["accent"], p["green"], p["amber"], p["red"]
+    C_TRAY_BG = p["tray_bg"]
+    return eff
+
+
+apply_theme("auto")  # 先给 C_* 一套值:下面的 PROVIDER_DOTS 等常量在导入期就要用
+
+PROVIDERS = ("claude", "codex", "gemini")
+PROVIDER_TITLES = {"claude": "Claude", "codex": "Codex", "gemini": "Gemini"}
+PROVIDER_DOTS = {"claude": C_ACCENT, "codex": "#10a37f", "gemini": "#4285f4"}
 CLAUDE_PLAN_BADGES = {"max": "MAX", "pro": "PRO", "team": "TEAM", "enterprise": "ENT"}
 CODEX_PLAN_BADGES = {"free": "FREE", "plus": "PLUS", "pro": "PRO", "prolite": "PRO LITE",
                      "team": "TEAM", "business": "BIZ", "enterprise": "ENT", "edu": "EDU"}
@@ -139,11 +216,12 @@ LABELS = {
     "seven_day": "7 天",
     "seven_day_opus": "7 天 · Opus",
     "seven_day_sonnet": "7 天 · Sonnet",
+    "seven_day_fable": "7 天 · Fable",
     "seven_day_cowork": "7 天 · Cowork",
     "seven_day_oauth_apps": "7 天 · 应用",
 }
 ORDER = ["five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet",
-         "seven_day_cowork", "seven_day_oauth_apps"]
+         "seven_day_fable", "seven_day_cowork", "seven_day_oauth_apps"]
 WEEK = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
 
@@ -203,6 +281,15 @@ def user_agent() -> str:
 # 全过程只读、best-effort:任何一步失败都静默跳过,回退到 CLI 凭证文件路径。
 def _desktop_dir() -> Path | None:
     if IS_WIN:
+        # MSIX (Microsoft Store) 版本:数据在 LocalAppData\Packages 下
+        local = os.environ.get("LOCALAPPDATA")
+        if local:
+            pkg = Path(local) / "Packages"
+            for d in pkg.glob("Claude_*"):
+                candidate = d / "LocalCache" / "Roaming" / "Claude" / "config.json"
+                if candidate.exists():
+                    return candidate.parent
+        # 经典安装版本:数据在 %APPDATA%\Claude
         base = os.environ.get("APPDATA")
         return Path(base) / "Claude" if base else None
     if IS_MAC:
@@ -382,7 +469,16 @@ def _desktop_decrypt(b64_value: str, keyinfo) -> bytes | None:
 
 def _claude_desktop_tokens() -> list[dict]:
     """读桌面版 config.json 里的 OAuth 令牌缓存,返回可用于 /api/oauth/usage 的候选:
-       [{'token','expiresAt'(秒),'refreshToken','plan'}],按 api.anthropic.com + user:inference 过滤。只读。"""
+       [{'token','expiresAt'(秒),'plan','client','v2'}]。
+
+       缓存键形如 "{client_id}:{org_id}:{audience}:{scopes}"。过滤按 **user:profile** 而不是
+       user:inference:/api/oauth/usage 要求的是 user:profile 作用域,缺它的令牌(桌面版缓存里
+       那个 "user:inference user:office" 的 Cowork 令牌)会被服务端以
+       403 permission_error "does not meet scope requirement user:profile" 拒绝。
+       反过来,只有 user:profile 的令牌是能用的——所以旧的 user:inference 过滤恰好是反的。
+
+       只读:不返回 refreshToken,也绝不续期/写回。桌面版自己会持续续期这些令牌,
+       任何第三方去轮换它们都会把桌面版挤下线(refreshToken 是一次性的)。"""
     d = _desktop_dir()
     if not d:
         return []
@@ -408,23 +504,36 @@ def _claude_desktop_tokens() -> list[dict]:
             continue
         if isinstance(obj, dict):
             for k, v in obj.items():
-                merged.setdefault(k, v)  # V2 优先
+                merged.setdefault(k, (v, cache_key == "oauth:tokenCacheV2"))  # V2 优先
     out = []
-    for k, v in merged.items():
+    for k, (v, is_v2) in merged.items():
         if not isinstance(v, dict):
             continue
         tok = v.get("token") or v.get("accessToken")
-        if not tok or "user:inference" not in k or "api.anthropic.com" not in k:
+        if not tok or "api.anthropic.com" not in k or "user:profile" not in k:
             continue
         exp = float(v.get("expiresAt") or 0)
         exp_s = exp / 1000.0 if exp > 1e12 else exp
         out.append({
             "token": tok,
             "expiresAt": exp_s,
-            "refreshToken": v.get("refreshToken"),
             "plan": CLAUDE_PLAN_BADGES.get(str(v.get("subscriptionType") or "").lower()),
+            "client": k.split(":", 1)[0],
+            "v2": is_v2,
         })
     return out
+
+
+def _best_desktop_token(cands: list[dict]) -> dict | None:
+    """挑最合适的桌面令牌。优先级:
+       1. client_id == CLAUDE_CLIENT_ID —— 与我们发出的 claude-code User-Agent 身份一致;
+          拿桌面版别的客户端(如 Cowork)的令牌冒充 claude-code 去请求,既容易触发风控,
+          也是之前 403 风暴的来源。
+       2. V2 缓存 —— 桌面版当前在用的那份,最新鲜。
+       3. 过期时间最晚。"""
+    if not cands:
+        return None
+    return max(cands, key=lambda d: (d["client"] == CLAUDE_CLIENT_ID, d["v2"], d["expiresAt"]))
 
 
 # ================= 数据层:Claude(与 Claude Code 同源) =================
@@ -560,13 +669,13 @@ def _claude_bearer_headers(tok: str) -> dict:
 
 def claude_headers(force_refresh: bool = False):
     """返回 (headers, error, plan)。取"最新鲜的有效令牌":
-       桌面版令牌(持续自动续期,只读)与 CLI 凭证文件二选其新;都过期时才用 refreshToken 续期。
+       优先桌面版令牌——桌面版自己会持续续期,我们只读,不会打扰它的登录态;
+       没有可用桌面令牌时才动 CLI 凭证(续期会轮换 refreshToken,属于有副作用的路径)。
        force_refresh=True(收到 401 后)跳过刚被拒的桌面令牌,直接走 CLI 凭证续期。"""
     now = time.time()
     if not force_refresh:
-        desk_valid = [d for d in _claude_desktop_tokens() if d["expiresAt"] > now + 60]
-        if desk_valid:
-            best = max(desk_valid, key=lambda d: d["expiresAt"])
+        best = _best_desktop_token([d for d in _claude_desktop_tokens() if d["expiresAt"] > now + 60])
+        if best:
             return _claude_bearer_headers(best["token"]), None, best.get("plan")
 
     creds, source = _claude_load()
@@ -579,18 +688,16 @@ def claude_headers(force_refresh: bool = False):
             err = _claude_refresh(creds, source)
             if err and (force_refresh or not exp_s or exp_s <= now):
                 # CLI 续期失败:退回任何还能用的桌面令牌(即便临期,也比无令牌强)
-                desk = _claude_desktop_tokens()
-                if desk:
-                    best = max(desk, key=lambda d: d["expiresAt"])
+                best = _best_desktop_token(_claude_desktop_tokens())
+                if best:
                     return _claude_bearer_headers(best["token"]), None, best.get("plan")
                 return None, err, plan
         tok = creds.get("claudeAiOauth", {}).get("accessToken")
         return _claude_bearer_headers(tok), None, plan
 
     # 无 CLI 凭证:最后再看桌面令牌(含已过期的兜底)
-    desk = _claude_desktop_tokens()
-    if desk:
-        best = max(desk, key=lambda d: d["expiresAt"])
+    best = _best_desktop_token(_claude_desktop_tokens())
+    if best:
         return _claude_bearer_headers(best["token"]), None, best.get("plan")
     return None, "未找到登录凭证:打开一次 Claude 桌面版,或在终端运行一次 claude 登录", None
 
@@ -607,41 +714,113 @@ def fetch_profile(headers: dict) -> dict | None:
 _profile_plan: str | None = None
 _profile_tried = False
 
+_usage_cache: dict | None = None     # 上次成功的结果(含 updated 时刻)
+_usage_next_at = 0.0                 # 软间隔:到点前不发请求,手动刷新可跳过
+_usage_block_until = 0.0             # 硬退避(429):手动刷新也得等
+_usage_backoff = 0.0                 # 当前退避时长,成功后清零
 
-def fetch_claude() -> dict:
-    """拉取 Claude 用量。返回 {"windows": [(key, util, resets_at, label)], "plan": …} 或 {"error": …}。"""
-    global _profile_plan, _profile_tried
+
+def _retry_after(r) -> float:
+    """取 retry-after。#30930 里服务端限流时会返回 retry-after: 0(误导性的),
+       所以只接受 > 0 的值,其余交给指数退避。"""
+    try:
+        v = float((r.headers.get("retry-after") or "").strip())
+        return v if v > 0 else 0.0
+    except ValueError:
+        return 0.0
+
+
+def _usage_error(msg: str) -> dict:
+    """失败时保留上次的好数据,只挂错误标记 —— 与官方 /usage "显示上次已知用量 + as of"
+       的行为一致,总比整张卡片变成一行报错好。"""
+    if _usage_cache is not None:
+        return {**_usage_cache, "error": msg}
+    return {"error": msg}
+
+
+def fetch_claude(force: bool = False) -> dict:
+    """拉取 Claude 用量。返回 {"windows": [(key, util, resets_at, label)], "plan": …, "updated": …}
+       或 {"error": …}(失败时附带上次的 windows)。"""
+    global _profile_plan, _profile_tried, _usage_cache, _usage_next_at, _usage_block_until, _usage_backoff
+    now = time.time()
+    if now < _usage_block_until:               # 429 退避中:一个请求都不发
+        return _usage_error(f"接口限流中,{int(_usage_block_until - now)} 秒后重试")
+    if not force and _usage_cache is not None and now < _usage_next_at:
+        return _usage_cache                    # 未到间隔:直接回缓存,不打扰共用的限流桶
+
     h, err, plan = claude_headers()
     if not h:
-        return {"error": err}
+        return _usage_error(err)
     try:
+        _usage_next_at = now + CLAUDE_MIN_INTERVAL
         r = requests.get(API_URL_USAGE, headers=h, timeout=10)
         if r.status_code == 401:  # 服务端拒绝旧 token → 强制续期后重试一次
             h, err, plan = claude_headers(force_refresh=True)
             if not h:
-                return {"error": err}
+                return _usage_error(err)
             r = requests.get(API_URL_USAGE, headers=h, timeout=10)
             if r.status_code == 401:
-                return {"error": "登录已过期:请在终端运行一次 claude 重新登录"}
+                return _usage_error("登录已过期:打开一次 Claude 桌面版,或在终端运行 claude 重新登录")
         if r.status_code == 429:
-            return {"error": "请求过于频繁,稍后自动重试"}
-        r.raise_for_status()
+            _usage_backoff = min(max(_usage_backoff * 2, CLAUDE_BACKOFF_MIN), CLAUDE_BACKOFF_MAX)
+            wait = _retry_after(r) or _usage_backoff
+            _usage_block_until = now + wait
+            return _usage_error(f"接口限流,{int(wait)} 秒后重试")
+        if r.status_code == 403:
+            msg = ""
+            try:
+                msg = ((r.json() or {}).get("error") or {}).get("message") or ""
+            except Exception:
+                pass
+            if "user:profile" in msg:  # 令牌作用域不对(见 _claude_desktop_tokens 注释)
+                return _usage_error("令牌缺少 user:profile 作用域:请打开一次 Claude 桌面版")
+            return _usage_error(f"无权访问(403){(':' + msg[:40]) if msg else ''}")
+        if not r.ok:
+            return _usage_error(f"获取失败(HTTP {r.status_code}),稍后重试")
         data = r.json()
-    except requests.ConnectionError:
-        return {"error": "网络连接失败,重试中…"}
+    except (requests.ConnectionError, requests.Timeout):
+        _usage_next_at = now + REFRESH_INTERVAL  # 没打到服务端,不必按 5 分钟等
+        return _usage_error("网络连接失败,重试中…")
     except Exception as e:
-        return {"error": f"获取失败:{type(e).__name__}"}
+        return _usage_error(f"获取失败:{type(e).__name__}")
+    _usage_backoff = 0.0
     wins = []
     for key, val in data.items():
         if (isinstance(val, dict) and val.get("utilization") is not None
                 and val.get("resets_at")):
             wins.append((key, float(val["utilization"]), val["resets_at"], LABELS.get(key, key)))
+    # 解析 limits 数组(新版 API:含 per-model scoped 限额,如 Fable)
+    seen = {w[0] for w in wins}
+    limits = data.get("limits")
+    if isinstance(limits, list):
+        for entry in limits:
+            if not isinstance(entry, dict) or entry.get("percent") is None or not entry.get("resets_at"):
+                continue
+            kind = entry.get("kind", "")
+            scope = entry.get("scope") or {}
+            model_name = (scope.get("model") or {}).get("display_name") or ""
+            if kind == "session":
+                key = "five_hour"
+            elif kind == "weekly_all":
+                key = "seven_day"
+            elif kind == "weekly_scoped" and model_name:
+                key = f"seven_day_{model_name.lower().replace(' ', '_')}"
+            else:
+                continue
+            label = LABELS.get(key, f"7 天 · {model_name}" if model_name else key)
+            item = (key, float(entry["percent"]), entry["resets_at"], label)
+            if key in seen:
+                wins = [item if w[0] == key else w for w in wins]
+            else:
+                wins.append(item)
+                seen.add(key)
     wins.sort(key=lambda it: (ORDER.index(it[0]) if it[0] in ORDER else len(ORDER), it[0]))
     if plan is None and not _profile_tried:  # 老版本凭证无 subscriptionType → 拉一次 profile 兜底
         _profile_tried = True
         acc = (fetch_profile(h) or {}).get("account", {})
         _profile_plan = "MAX" if acc.get("has_claude_max") else ("PRO" if acc.get("has_claude_pro") else None)
-    return {"windows": wins, "plan": plan or _profile_plan}
+    _usage_cache = {"windows": wins, "plan": plan or _profile_plan, "updated": time.time()}
+    return _usage_cache
 
 
 # ================= 数据层:Codex(与 Codex CLI 同源) =================
@@ -698,8 +877,9 @@ def _codex_window_label(secs: float) -> str:
     return "每周" if d == 7 else f"{d} 天"
 
 
-def fetch_codex() -> dict:
-    """拉取 Codex(ChatGPT 登录)限额。返回结构与 fetch_claude 一致。"""
+def fetch_codex(force: bool = False) -> dict:
+    """拉取 Codex(ChatGPT 登录)限额。返回结构与 fetch_claude 一致。
+       force 仅为与 fetch_claude 保持同签名——Codex 的接口不共用 Claude 那种账号级限流桶。"""
     auth = _codex_load()
     if auth is None:
         return {"error": "未找到 Codex 凭证:请先运行 codex 登录"}
@@ -758,7 +938,142 @@ def fetch_codex() -> dict:
     return {"windows": wins, "plan": CODEX_PLAN_BADGES.get(plan) or (plan.replace("_", " ").upper()[:8] if plan else None)}
 
 
-FETCHERS = {"claude": fetch_claude, "codex": fetch_codex}
+# ================= 数据层:Gemini(油猴脚本推送) =================
+# 别的数据源都是"读本地凭证 → 调官方接口",Gemini 走不通这条路:
+#   · 没有 CLI 凭证可读(gemini-cli 的 OAuth 也够不到网页版的配额);
+#   · 浏览器 cookie 从 Chrome 127+ 起是 App-Bound Encryption(v20),DPAPI 密钥解不开。
+#     绕过它只有"冒充浏览器的 COM 提权接口"或"杀 network service 子进程抢文件"两条路,
+#     都不是一张用量卡片该干的事。
+# 所以反过来:页面里本来就有活着的会话,让油猴脚本(gemini_bridge.user.js)在页面里取数,
+# 把算好的百分比推给我们。卡片只在 127.0.0.1 上收数显示,永不接触任何 Google 凭证。
+GEMINI_PORT = 47615
+GEMINI_ORIGIN = "https://gemini.google.com"
+GEMINI_STALE_AFTER = 900  # 超过这么久没收到推送 → 标记可能过期(标签页多半关了)
+GEMINI_SCRIPT = Path(__file__).with_name("gemini_bridge.user.js")
+GEMINI_INSTALL_URL = f"http://127.0.0.1:{GEMINI_PORT}/gemini.user.js"
+
+_gemini_lock = threading.Lock()
+_gemini_data: dict | None = None
+_gemini_server = None  # None=未起;False=端口占用,不再重试;否则=server 实例
+
+
+def _gemini_windows(obj) -> list:
+    """把脚本推来的 {'five_hour': {'percent','resets_at'}, …} 转成卡片内部的窗口元组。"""
+    if not isinstance(obj, dict):
+        return []
+    wins = []
+    for src, key, label in (("five_hour", "gemini_5h", "5 小时"),
+                            ("seven_day", "gemini_weekly", "本周")):
+        v = obj.get(src)
+        if not isinstance(v, dict) or v.get("percent") is None:
+            continue
+        try:
+            pct = float(v["percent"])
+        except (TypeError, ValueError):
+            continue
+        try:
+            ts = v.get("resets_at")
+            iso = datetime.fromtimestamp(float(ts), timezone.utc).isoformat() if ts else ""
+        except (TypeError, ValueError, OSError, OverflowError):
+            iso = ""
+        wins.append((key, max(0.0, min(pct, 100.0)), iso, label))
+    return wins
+
+
+class _GeminiHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass  # 别把访问日志刷到 stderr
+
+    def _send(self, code, body=b"", ctype="text/plain; charset=utf-8"):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        # 这几个头**不是**给自家脚本用的:油猴的 GM_xmlhttpRequest 走扩展后台发请求,
+        # 本来就不受 CORS 约束(而且它也只能走那条路——Google 给 gemini.google.com 下发的
+        # CSP connect-src 里没有 127.0.0.1,页面内的 fetch 打不到这儿来)。
+        # 配 CORS 纯粹是为了挡住**别的**网站:它们要 POST 就得带 application/json(见
+        # do_POST 的 415),而那必然触发预检,预检拿到的 ACAO 只认 Gemini,于是被浏览器拦掉。
+        self.send_header("Access-Control-Allow-Origin", GEMINI_ORIGIN)
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def do_OPTIONS(self):
+        self._send(204)
+
+    def do_GET(self):
+        # 顺手把脚本自己发出去 —— 端口已经填好,装的时候不用手改
+        if self.path.split("?")[0] != "/gemini.user.js":
+            return self._send(404)
+        try:
+            src = GEMINI_SCRIPT.read_text(encoding="utf-8").replace("__PORT__", str(GEMINI_PORT))
+        except Exception:
+            return self._send(404, b"gemini_bridge.user.js not found")
+        self._send(200, src.encode("utf-8"), "application/javascript; charset=utf-8")
+
+    def do_POST(self):
+        global _gemini_data
+        if self.path.split("?")[0] != "/gemini":
+            return self._send(404)
+        # 必须是 JSON:跨源请求带这个 Content-Type 就一定要先过预检,而预检只放行 Gemini。
+        # 少了这一条,任意网站都能用 text/plain 的"简单请求"往卡片塞假数字。
+        if "application/json" not in (self.headers.get("Content-Type") or ""):
+            return self._send(415)
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            if not 0 < n <= 65536:
+                return self._send(400)
+            obj = json.loads(self.rfile.read(n))
+        except Exception:
+            return self._send(400)
+        wins = _gemini_windows(obj)
+        if not wins:
+            return self._send(400)
+        with _gemini_lock:
+            _gemini_data = {"windows": wins, "plan": None, "updated": time.time()}
+        self._send(204)
+
+
+class _GeminiServer(ThreadingHTTPServer):
+    daemon_threads = True
+    # HTTPServer 默认 allow_reuse_address=1,这里必须关掉。Windows 上 SO_REUSEADDR 的语义
+    # 跟 Unix 不同 —— 它允许**直接抢占**一个已经在监听的端口:两个进程都 bind 成功,然后
+    # 连接被随机分给其中之一。那样端口冲突就不会抛 OSError,下面"端口被占用"的提示成了
+    # 死代码,故障现场只会表现成"脚本明明在推,卡片却一直收不到数据",极难排查。
+    allow_reuse_address = False
+
+
+def _gemini_serve() -> None:
+    """起本地监听。只在 Gemini 数据源启用后第一次取数时调用 —— 不用就不占端口。"""
+    global _gemini_server
+    if _gemini_server is not None:
+        return
+    try:
+        _gemini_server = _GeminiServer(("127.0.0.1", GEMINI_PORT), _GeminiHandler)
+    except OSError:
+        _gemini_server = False  # 端口被占(多半是另一个实例),别反复重试
+        return
+    threading.Thread(target=_gemini_server.serve_forever, daemon=True).start()
+
+
+def fetch_gemini(force: bool = False) -> dict:
+    """取最近一次油猴脚本推来的用量。这里不发任何网络请求 —— 数据是被推过来的。"""
+    _gemini_serve()
+    if _gemini_server is False:
+        return {"error": f"端口 {GEMINI_PORT} 被占用,Gemini 收不到数据"}
+    with _gemini_lock:
+        data = _gemini_data
+    if data is None:
+        return {"error": "等待 Gemini 脚本推送…右键菜单可装脚本"}
+    if time.time() - data["updated"] > GEMINI_STALE_AFTER:
+        return {**data, "error": "Gemini 标签页未打开,数据可能过期"}
+    return data
+
+
+FETCHERS = {"claude": fetch_claude, "codex": fetch_codex, "gemini": fetch_gemini}
 
 
 # ================= 展示辅助 =================
@@ -832,9 +1147,14 @@ class QuotaCard:
         self.zoom = float(cfg.get("zoom", 1.0))
         self.alpha = float(cfg.get("alpha", 0.97))
         self.pinned = bool(cfg.get("pinned", True))
+        self.clickthrough = bool(cfg.get("clickthrough", False))
         self.hidden = set(cfg.get("hidden", []))
         self.reset_mode = cfg.get("reset_mode", "clock")
         self.tray_key = cfg.get("tray_key", DEFAULT_TRAY_KEY)
+        self.theme_mode = cfg.get("theme", "auto")
+        self.show_title = bool(cfg.get("show_title", True))
+        self._theme_eff = apply_theme(self.theme_mode)
+        self._theme_checked = 0.0
         prov = cfg.get("providers")
         if not isinstance(prov, dict):  # 首次运行/旧配置:Claude 默认开;装了 Codex 就一并开
             prov = {"claude": True, "codex": CODEX_AUTH.exists()}
@@ -851,18 +1171,23 @@ class QuotaCard:
         #   macOS   -> systemTransparent 背景:真透明、圆角
         #   Linux   -> 无色键,退化为不透明卡片(方角),仍可整体半透明
         # 设环境变量 QUOTA_CARD_OPAQUE=1 可在任意系统强制不透明(用于排查显示异常)。
+        # _canvas_keyed:画布底色是不是"透明色键"。是的话它与主题无关(卡片本体由 render()
+        # 画的圆角矩形着色);不是的话换肤必须同步改画布底色,否则深色卡片会顶着一圈白边。
         canvas_bg = C_CARD
+        self._canvas_keyed = False
         force_opaque = bool(os.environ.get("QUOTA_CARD_OPAQUE"))
         if not force_opaque and IS_WIN:
             try:
                 self.root.attributes("-transparentcolor", TRANSPARENT)
                 canvas_bg = TRANSPARENT
+                self._canvas_keyed = True
             except Exception:
                 canvas_bg = C_CARD
         elif not force_opaque and IS_MAC:
             try:
                 self.root.configure(bg="systemTransparent")
                 canvas_bg = "systemTransparent"
+                self._canvas_keyed = True
             except Exception:
                 canvas_bg = C_CARD
         else:
@@ -881,6 +1206,10 @@ class QuotaCard:
                                 width=self.s(BW), height=self.s(120))
         self.canvas.pack(fill="both", expand=True)
         self._place_window(cfg)
+
+        # 应用鼠标穿透设置
+        if self.clickthrough:
+            self._apply_clickthrough(True)
 
         self.canvas.bind("<Button-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_drag)
@@ -921,25 +1250,38 @@ class QuotaCard:
 
     # ---- 后台轮询 ----
     def _worker(self):
+        force = False
         while not self._stop:
             for p in PROVIDERS:
                 if not self.providers.get(p) or self._stop:
                     continue
-                res = FETCHERS[p]()
+                res = FETCHERS[p](force=force)
                 old = self.state.get(p) or {}
                 if "windows" in res:
+                    # fetch_* 在限流/网络故障时会连同 error 一起回上次的好数据,此时
+                    # updated 是那份数据真正的取得时刻,不能盖成"现在"——否则卡片会
+                    # 谎称"刚刚更新"。
                     cur = {"windows": res["windows"], "plan": res.get("plan") or old.get("plan"),
-                           "error": None, "updated": time.time()}
-                else:  # 失败时保留上一次数据,只标注错误
+                           "error": res.get("error"), "updated": res.get("updated") or time.time()}
+                else:  # 连上次数据都没有:只标注错误
                     cur = {"windows": old.get("windows") or [], "plan": old.get("plan"),
                            "error": res.get("error"), "updated": old.get("updated", 0)}
                 self.state = {**self.state, p: cur}
-            self._refresh_evt.wait(REFRESH_INTERVAL)
+            # wait 返回 True = 被"立即刷新"唤醒 → 下一轮跳过软间隔,真正发一次请求
+            force = self._refresh_evt.wait(REFRESH_INTERVAL)
             self._refresh_evt.clear()
 
     def _tick(self):
         if self._stop:
             return
+        # 跟随系统时,系统主题是可能中途被改的。10 秒探一次:每秒读注册表太浪费,
+        # 而换肤本来也不急在一秒。
+        if self.theme_mode == "auto" and time.time() - self._theme_checked > 10:
+            self._theme_checked = time.time()
+            eff = system_theme()
+            if eff != self._theme_eff:
+                self._theme_eff = apply_theme("auto")
+                self._repaint_theme()  # 不落盘:模式没变,变的是系统
         if not self._hidden_card:
             self.render()
         self.root.after(1000, self._tick)
@@ -993,15 +1335,23 @@ class QuotaCard:
 
         # 头部:单数据源沿用旧样式(标题+套餐徽标);多数据源标题改为 AI 用量,徽标移到各分节
         hy = PAD + self.s(11)
-        cv.create_oval(PAD, hy - self.s(4), PAD + self.s(8), hy + self.s(4), fill=C_ACCENT, outline="")
-        if not multi and secs:
-            title, badge = f"{PROVIDER_TITLES[secs[0]['p']]} 用量", secs[0]["plan"]
+        # 单数据源时分节标题不画,警示就得落在这个大标题上,否则只剩底部一行小字
+        head_stale = bool(secs) and not multi and self._stale(secs[0])
+        cv.create_oval(PAD, hy - self.s(4), PAD + self.s(8), hy + self.s(4),
+                       fill=C_RED if head_stale else C_ACCENT, outline="")
+        badge = secs[0]["plan"] if (not multi and secs) else None
+        if not self.show_title:
+            title = ""
+        elif not multi and secs:
+            title = f"{PROVIDER_TITLES[secs[0]['p']]} 用量"
         else:
-            title, badge = "AI 用量", None
+            title = "AI 用量"
         tid = cv.create_text(PAD + self.s(16), hy, text=title, anchor="w",
-                             fill=C_TITLE, font=self.f(15, "bold"))
+                             fill=C_RED if head_stale else C_TITLE, font=self.f(15, "bold"))
         if badge:
-            self._draw_badge(cv, cv.bbox(tid)[2] + self.s(8), hy, badge)
+            # 标题关掉时文本是空的,bbox 可能拿不到 → 退回贴着圆点放
+            bb = cv.bbox(tid)
+            self._draw_badge(cv, (bb[2] if bb else PAD + self.s(14)) + self.s(8), hy, badge)
         # 顶部按钮(统一尺寸 + 统一线条风格,从右往左):关闭 / 刷新 / 菜单 / 图钉
         ri = self.s(7)
         sw = max(2, int(round(1.7 * SCALE * self.zoom)))
@@ -1040,6 +1390,28 @@ class QuotaCard:
         self._draw_footer(cv, W, H, PAD, secs)
         self._update_tray(secs)
 
+    def _stale(self, s_) -> bool:
+        """这一节的数字还能不能信?两种情况都算不新鲜:
+           · 有 error —— 限流、断网、令牌问题…本轮没拿到新数据;
+           · 太久没成功刷新 —— 有些故障不报错,只表现为 updated 不再前进。
+           不新鲜就把标题标红:宁可显眼,也不能让旧数字冒充新的。"""
+        if s_["error"]:
+            return True
+        up = s_["updated"]
+        return bool(up) and (time.time() - up) > STALE_AFTER
+
+    def _stale_note(self, s_) -> str:
+        """标题旁边那句短提示:说清"多久没更新了",光一个 ⚠ 说明不了问题。"""
+        up = s_["updated"]
+        if not up:
+            return "无数据"
+        ago = int(time.time() - up)
+        if ago < 60:
+            return f"{ago} 秒前"
+        if ago < 3600:
+            return f"{ago // 60} 分前"
+        return f"{ago // 3600} 时前"
+
     def _draw_badge(self, cv, x, cy, text, small=False):
         bw = self.s((10 if small else 12) + (6 if small else 7) * len(text))
         bh = self.s(7 if small else 8)
@@ -1048,14 +1420,16 @@ class QuotaCard:
 
     def _draw_section(self, cv, y, SEC, s_, W, PAD):
         cy = y + SEC / 2 + self.s(3)
+        stale = self._stale(s_)
         cv.create_oval(PAD, cy - self.s(3), PAD + self.s(6), cy + self.s(3),
-                       fill=PROVIDER_DOTS.get(s_["p"], C_SUB), outline="")
+                       fill=C_RED if stale else PROVIDER_DOTS.get(s_["p"], C_SUB), outline="")
         tid = cv.create_text(PAD + self.s(12), cy, text=PROVIDER_TITLES[s_["p"]], anchor="w",
-                             fill=C_TITLE, font=self.f(12, "bold"))
+                             fill=C_RED if stale else C_TITLE, font=self.f(12, "bold"))
         if s_["plan"]:
             self._draw_badge(cv, cv.bbox(tid)[2] + self.s(6), cy, s_["plan"], small=True)
-        if s_["error"] and s_["shown"]:  # 有旧数据但本轮刷新失败 → 分节右侧亮警示
-            cv.create_text(W - PAD, cy, text="⚠", anchor="e", fill=C_AMBER, font=self.f(11))
+        if stale and s_["shown"]:  # 有旧数据但没刷上 → 右侧写明多久没更新了
+            cv.create_text(W - PAD, cy, text=f"⚠ {self._stale_note(s_)}", anchor="e",
+                           fill=C_RED, font=self.f(9, "bold"))
 
     def _draw_row(self, cv, y, label, util, resets_at, W, PAD):
         col = bar_color(util)
@@ -1081,14 +1455,22 @@ class QuotaCard:
         fy = H - PAD + self.s(2)
         have_data = [s_ for s_ in secs if s_["updated"]]
         has_err = any(s_["error"] for s_ in secs)
+        stale = [s_ for s_ in secs if self._stale(s_)]
         if not secs:
             dot, text = C_DIM, "未启用数据源"
         elif not have_data:
             dot, text = (C_RED, "未连接") if has_err else (C_AMBER, "正在加载…")
         else:
-            ago = int(time.time() - max(s_["updated"] for s_ in have_data))
+            # 用最**旧**的一节算年龄:多数据源时,一个卡住了另一个还在刷,取 max 会把
+            # 卡住的那个藏起来,底部显示"刚刚更新"就成了谎话。
+            ago = int(time.time() - min(s_["updated"] for s_ in have_data))
             text = "刚刚更新" if ago < 5 else (f"{ago} 秒前更新" if ago < 60 else f"{ago // 60} 分前更新")
-            dot, text = (C_AMBER, text + " · 可能过期") if has_err else (C_GREEN, text)
+            if stale:
+                # 把具体是谁出问题写出来 —— 多数据源时"可能过期"根本不知道说的是哪个
+                who = "、".join(PROVIDER_TITLES[s_["p"]] for s_ in stale)
+                dot, text = C_RED, f"{text} · {who} 未刷新"
+            else:
+                dot, text = C_GREEN, text
         cv.create_oval(PAD, fy - self.s(3), PAD + self.s(6), fy + self.s(3), fill=dot, outline="")
         cv.create_text(PAD + self.s(12), fy, text=text, anchor="w", fill=C_DIM, font=self.f(10))
         cv.create_text(W - PAD, fy, text=datetime.now().strftime("%H:%M:%S"),
@@ -1145,10 +1527,10 @@ class QuotaCard:
         sz = 64
         img = Image.new("RGBA", (sz, sz), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
-        # 背景几乎填满整张图(让托盘里看起来和别的图标一样大),用量色描边
+        # 白底 + 用量色描边 + 用量色数字——在深/浅任务栏上都清晰可辨
         d.rounded_rectangle([1, 1, sz - 2, sz - 2], radius=14,
-                            fill=(27, 28, 32, 255), outline=tuple(rgb) + (255,), width=4)
-        txt = f"{int(round(util))}%"
+                            fill=C_TRAY_BG, outline=tuple(rgb) + (255,), width=4)
+        txt = f"{int(round(util))}"
         # 自适应字号:在留白内尽量放大
         font = self._load_font(16)
         for size in range(46, 14, -2):
@@ -1323,6 +1705,8 @@ class QuotaCard:
             self._prov_vars[p] = var
             pm.add_checkbutton(label=PROVIDER_TITLES[p], variable=var,
                                command=lambda pp=p: self.toggle_provider(pp))
+        pm.add_separator()
+        pm.add_command(label="安装 Gemini 脚本…", command=self.install_gemini_script)
         m.add_cascade(label="数据源", menu=pm)
 
         # 卡片显示(勾选要显示哪几个窗口)
@@ -1375,9 +1759,24 @@ class QuotaCard:
                            command=lambda: self.set_reset_mode("count"))
         m.add_cascade(label="重置显示", menu=rm)
 
+        # 主题(跟随系统 / 浅色 / 深色)
+        tm2 = tk.Menu(m, tearoff=0)
+        self._theme_var = tk.StringVar(value=self.theme_mode)
+        for val, lbl in THEME_MODES:
+            show = f"{lbl}(当前:{'浅色' if self._theme_eff == 'light' else '深色'})" \
+                if val == "auto" else lbl
+            tm2.add_radiobutton(label=show, value=val, variable=self._theme_var,
+                                command=lambda v=val: self.set_theme(v))
+        m.add_cascade(label="主题", menu=tm2)
+
         m.add_separator()
+        self._title_var = tk.BooleanVar(value=self.show_title)
+        m.add_checkbutton(label="显示标题", variable=self._title_var, command=self.toggle_title)
         self._pin_var = tk.BooleanVar(value=self.pinned)
         m.add_checkbutton(label="窗口置顶", variable=self._pin_var, command=self.toggle_pin)
+        if IS_WIN:
+            self._clickthrough_var = tk.BooleanVar(value=self.clickthrough)
+            m.add_checkbutton(label="鼠标穿透", variable=self._clickthrough_var, command=self.toggle_clickthrough)
         if self.tray:
             m.add_command(label="隐藏到托盘", command=self.toggle_card)
         m.add_command(label="退出", command=self.quit)
@@ -1394,6 +1793,19 @@ class QuotaCard:
         self.render()
         self._save_cfg()
 
+    def install_gemini_script(self):
+        """在浏览器里打开脚本地址;装了油猴的话会直接弹出安装页。"""
+        import webbrowser
+        self.providers["gemini"] = True  # 先把数据源打开,否则监听没起来,这个地址是打不开的
+        _gemini_serve()
+        self.refresh_now()
+        self.render()
+        self._save_cfg()
+        try:
+            webbrowser.open(GEMINI_INSTALL_URL)
+        except Exception:
+            pass
+
     def set_zoom(self, z):
         z = max(MIN_ZOOM, min(MAX_ZOOM, z))
         if abs(z - self.zoom) < 1e-3:
@@ -1409,6 +1821,33 @@ class QuotaCard:
 
     def set_reset_mode(self, mode):
         self.reset_mode = mode
+        self.render()
+        self._save_cfg()
+
+    def _sync_canvas_bg(self):
+        """非色键模式下,画布底色得跟着主题走(色键模式下它是透明键,不能碰)。"""
+        if self._canvas_keyed:
+            return
+        try:
+            self.canvas.config(bg=C_CARD)
+            self.root.configure(bg=C_CARD)
+        except Exception:
+            pass
+
+    def _repaint_theme(self):
+        """主题已经 apply 过了,把界面刷新一遍。"""
+        self._sync_canvas_bg()
+        self._tray_sig = None  # 托盘图标底色也换了,强制重画
+        self.render()
+
+    def set_theme(self, mode):
+        self.theme_mode = mode
+        self._theme_eff = apply_theme(mode)
+        self._repaint_theme()
+        self._save_cfg()
+
+    def toggle_title(self):
+        self.show_title = not self.show_title
         self.render()
         self._save_cfg()
 
@@ -1429,6 +1868,32 @@ class QuotaCard:
         self.render()
         self._save_cfg()
 
+    def toggle_clickthrough(self):
+        self.clickthrough = not self.clickthrough
+        self._apply_clickthrough(self.clickthrough)
+        self.render()
+        self._save_cfg()
+
+    def _apply_clickthrough(self, enable: bool):
+        """应用鼠标穿透设置(仅 Windows 支持)"""
+        if not IS_WIN:
+            return
+        try:
+            import ctypes
+            import ctypes.wintypes as wt
+            GWL_EXSTYLE = -20
+            WS_EX_LAYERED = 0x00080000
+            WS_EX_TRANSPARENT = 0x00000020
+            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            if enable:
+                style |= WS_EX_LAYERED | WS_EX_TRANSPARENT
+            else:
+                style &= ~(WS_EX_TRANSPARENT)
+            ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+        except Exception:
+            pass
+
     def toggle_card(self):
         if self._hidden_card:
             self.root.deiconify()
@@ -1442,6 +1907,12 @@ class QuotaCard:
     def quit(self):
         self._stop = True
         self._save_cfg()
+        if _gemini_server:
+            try:
+                _gemini_server.shutdown()
+                _gemini_server.server_close()  # shutdown() 只停循环,不放端口
+            except Exception:
+                pass
         if self.tray:
             try:
                 self.tray.stop()
@@ -1470,8 +1941,10 @@ class QuotaCard:
             STATE_FILE.write_text(json.dumps({
                 "x": self.root.winfo_x(), "y": self.root.winfo_y(),
                 "alpha": round(self.alpha, 3), "zoom": round(self.zoom, 3),
-                "pinned": self.pinned, "hidden": sorted(self.hidden),
+                "pinned": self.pinned, "clickthrough": self.clickthrough,
+                "hidden": sorted(self.hidden),
                 "reset_mode": self.reset_mode, "tray_key": self.tray_key,
+                "theme": self.theme_mode, "show_title": self.show_title,
                 "providers": dict(self.providers),
             }, ensure_ascii=False), encoding="utf-8")
         except Exception:
@@ -1488,7 +1961,18 @@ def run_check():
             pass
     print("Claude 凭证:", CREDENTIALS, "存在" if CREDENTIALS.exists() else "不存在")
     print("Codex 凭证:", CODEX_AUTH, "存在" if CODEX_AUTH.exists() else "不存在")
+    print("Gemini 脚本:", GEMINI_SCRIPT, "存在" if GEMINI_SCRIPT.exists() else "不存在")
+    print("         装法: 卡片右键 → 数据源 → 安装 Gemini 脚本…  (或开卡片后访问",
+          GEMINI_INSTALL_URL + ")")
     print("User-Agent:", user_agent())
+    # 桌面版令牌一览:/api/oauth/usage 要 user:profile 作用域,缺它的令牌会被 403 拒绝,
+    # 所以把"看到几个可用、最后选了哪个"打出来——之前选错令牌就是栽在这里。
+    desk = _claude_desktop_tokens()
+    best = _best_desktop_token(desk)
+    print(f"桌面版令牌: {len(desk)} 个带 user:profile 可用" +
+          (f",选用 client={best['client'][:8]}…({'V2' if best['v2'] else 'V1'} 缓存,"
+           f"{'与 UA 同源' if best['client'] == CLAUDE_CLIENT_ID else '非 claude-code 客户端'})"
+           if best else ""))
     for name, fetch in (("Claude", fetch_claude), ("Codex", fetch_codex)):
         res = fetch()
         if "error" in res:
